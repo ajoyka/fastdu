@@ -1,7 +1,8 @@
 package main
 
 import (
-	"concdu/lib"
+	"fastdu/lib"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -20,13 +21,14 @@ var fileSizes = make(chan int64)
 var nbytes int64
 var files int64
 var wg sync.WaitGroup
+var topFiles = flag.Int("t", 10, "number of top files/directories to display")
 
 func main() {
 	dirCount := &dirCount{size: make(map[string]int64)}
 	go func() { // important that this be first
 		fmt.Println("entering go func")
 		for size := range fileSizes {
-			files += 1
+			files++
 			nbytes += size
 		}
 		fmt.Println("go func exiting")
@@ -41,8 +43,8 @@ func main() {
 	fmt.Println("size len:", len(dirCount.size))
 	keys := lib.SortedKeys(dirCount.size)
 
-	for _, key := range keys[:5] {
-		fmt.Printf("%.1fMB, %s\n", float64(dirCount.size[key])/1e6, key)
+	for _, key := range keys[:*topFiles] {
+		fmt.Printf("%.1fGB, %s\n", float64(dirCount.size[key])/1e9, key)
 	}
 	fmt.Printf("%d files, %.1fGB\n", files, float64(nbytes)/1e9)
 }
@@ -78,4 +80,3 @@ func dirents(dir string) []os.FileInfo {
 	}
 	return info
 }
-
