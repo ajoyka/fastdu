@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fastdu/lib"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 type dirCount struct {
@@ -15,15 +17,21 @@ type dirCount struct {
 	size map[string]int64
 }
 
-var sema = make(chan struct{}, 20)
+// limit number of files that are open simultaneously to avoid
+// hitting into os limits
 var fileSizes = make(chan int64)
 
 var nbytes int64
 var files int64
 var wg sync.WaitGroup
 var topFiles = flag.Int("t", 10, "number of top files/directories to display")
+var numOpenFiles = flag.Int("c", 20, "concurrency factor")
+var sema chan struct{}
 
 func main() {
+	flag.Parse()
+	sema = make(chan struct{}, *numOpenFiles)
+	fmt.Println("concurrency factor", cap(sema), *numOpenFiles)
 	dirCount := &dirCount{size: make(map[string]int64)}
 	go func() { // important that this be first
 		fmt.Println("entering go func")
@@ -34,7 +42,7 @@ func main() {
 		fmt.Println("go func exiting")
 	}()
 
-	for _, dir := range os.Args[1:] {
+	for _, dir := range flag.Args() {
 		wg.Add(1)
 		go walkDir(dir, dirCount, fileSizes)
 	}
@@ -43,8 +51,33 @@ func main() {
 	fmt.Println("size len:", len(dirCount.size))
 	keys := lib.SortedKeys(dirCount.size)
 
-	for _, key := range keys[:*topFiles] {
-		fmt.Printf("%.1fGB, %s\n", float64(dirCount.size[key])/1e9, key)
+	if *topFiles > len(keys) || *topFiles == -1 {
+		fmt.Printf("Printing top available %d\n ", len(keys))
+	} else {
+		keys = keys[:*topFiles]
+		fmt.Printf("Printing top %d dirs/files\n", *topFiles)
+	}
+
+	for _, key := range keys {
+		size := float64(dirCount.size[key])
+		sizeGB := size / 1e9
+		sizeMB := size / 1e6
+		sizeKB := size / 1e3
+		var units string
+
+		switch {
+		case sizeGB > 0.09:
+			size = sizeGB
+			units = "GB"
+		case sizeMB > 0.09:
+			size = sizeMB
+			units = "MB"
+		default:
+			size = sizeKB
+			units = "KB"
+
+		}
+		fmt.Printf("%.1f%s, %s\n", size, units, key)
 	}
 	fmt.Printf("%d files, %.1fGB\n", files, float64(nbytes)/1e9)
 }
@@ -73,8 +106,13 @@ func dirents(dir string) []os.FileInfo {
 	defer func() {
 		<-sema // release token
 	}()
+
 	info, err := ioutil.ReadDir(dir)
 	if err != nil {
+		if errors.Is(err, syscall.EMFILE) {
+			fmt.Printf("\n**Error: %s\nReduce concurrency and retry\n", err)
+			os.Exit(1)
+		}
 		fmt.Printf("%s, %v\n", dir, err)
 		return nil
 	}
