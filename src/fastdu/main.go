@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type dirCount struct {
@@ -17,15 +18,21 @@ type dirCount struct {
 	size map[string]int64
 }
 
+type fileCount struct {
+	mu     sync.Mutex
+	files  int64
+	nbytes int64
+}
+
 // limit number of files that are open simultaneously to avoid
 // hitting into os limits
 var fileSizes = make(chan int64)
 
-var nbytes int64
-var files int64
 var wg sync.WaitGroup
 var topFiles = flag.Int("t", 10, "number of top files/directories to display")
 var numOpenFiles = flag.Int("c", 20, "concurrency factor")
+
+var printInterval = flag.Duration("f", 0*time.Second, "print summary at frequency specified in seconds; default disabled with value 0")
 var sema chan struct{}
 
 func main() {
@@ -33,21 +40,52 @@ func main() {
 	sema = make(chan struct{}, *numOpenFiles)
 	fmt.Println("concurrency factor", cap(sema), *numOpenFiles)
 	dirCount := &dirCount{size: make(map[string]int64)}
-	go func() { // important that this be first
-		fmt.Println("entering go func")
-		for size := range fileSizes {
-			files++
-			nbytes += size
+	fileCount := &fileCount{}
+
+	roots := flag.Args()
+
+	var tick <-chan time.Time
+	if *printInterval != 0 {
+		tick = time.Tick(*printInterval)
+	}
+	go func() {
+	loop:
+		for {
+			// fmt.Println("in loop")
+			select {
+			case size, ok := <-fileSizes:
+				if !ok {
+					break loop // fileSizes was closed
+				}
+				fileCount.Inc(size)
+
+			case <-tick:
+				fmt.Print(".")
+				// printFiles(dirCount)
+				// fmt.Println("total bytes: ", nbytes)
+			}
 		}
-		fmt.Println("go func exiting")
+
 	}()
 
-	for _, dir := range flag.Args() {
+	for _, root := range roots {
 		wg.Add(1)
-		go walkDir(dir, dirCount, fileSizes)
+		fmt.Println("starting walkdir")
+		go walkDir(root, dirCount, fileSizes)
 	}
+
 	wg.Wait()
 	close(fileSizes)
+
+	printFiles(dirCount)
+	files, nbytes := fileCount.Get()
+	fmt.Printf("%d files, %.1fGB\n", files, float64(nbytes)/1e9)
+
+}
+
+func printFiles(dirCount *dirCount) {
+	dirCount.mu.Lock()
+	defer dirCount.mu.Unlock()
 	fmt.Println("size len:", len(dirCount.size))
 	keys := lib.SortedKeys(dirCount.size)
 
@@ -79,7 +117,6 @@ func main() {
 		}
 		fmt.Printf("%.1f%s, %s\n", size, units, key)
 	}
-	fmt.Printf("%d files, %.1fGB\n", files, float64(nbytes)/1e9)
 }
 
 func walkDir(dir string, dirCount *dirCount, fileSizes chan<- int64) {
@@ -99,6 +136,21 @@ func (d *dirCount) Inc(path string, size int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.size[path] += size
+}
+
+func (f *fileCount) Inc(size int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.files++
+	f.nbytes += size
+}
+
+func (f *fileCount) Get() (int64, int64) {
+	f.mu.Lock()
+	f.mu.Unlock()
+
+	return f.files, f.nbytes
 }
 
 func dirents(dir string) []os.FileInfo {
