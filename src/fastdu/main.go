@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,6 +32,7 @@ var fileSizes = make(chan int64)
 var wg sync.WaitGroup
 var topFiles = flag.Int("t", 10, "number of top files/directories to display")
 var numOpenFiles = flag.Int("c", 20, "concurrency factor")
+var summary = flag.Bool("s", false, "print summary only")
 
 var printInterval = flag.Duration("f", 0*time.Second, "print summary at frequency specified in seconds; default disabled with value 0")
 var sema chan struct{}
@@ -48,6 +50,9 @@ func main() {
 	if *printInterval != 0 {
 		tick = time.Tick(*printInterval)
 	}
+
+	var nbytes, files int64
+
 	go func() {
 	loop:
 		for {
@@ -60,9 +65,9 @@ func main() {
 				fileCount.Inc(size)
 
 			case <-tick:
-				fmt.Print(".")
 				// printFiles(dirCount)
-				// fmt.Println("total bytes: ", nbytes)
+				files, nbytes = fileCount.Get()
+				fmt.Printf("\n%d files, %.1fGB\n", files, float64(nbytes)/1e9)
 			}
 		}
 
@@ -70,7 +75,6 @@ func main() {
 
 	for _, root := range roots {
 		wg.Add(1)
-		fmt.Println("starting walkdir")
 		go walkDir(root, dirCount, fileSizes)
 	}
 
@@ -78,16 +82,39 @@ func main() {
 	close(fileSizes)
 
 	printFiles(dirCount)
-	files, nbytes := fileCount.Get()
+	files, nbytes = fileCount.Get()
 	fmt.Printf("%d files, %.1fGB\n", files, float64(nbytes)/1e9)
 
+}
+
+// getTop returns aggregated totals for the top level
+// directories
+func (d *dirCount) getTop() map[string]int64 {
+	res := make(map[string]int64)
+	for key, val := range d.size {
+		top := strings.Split(key, "/")
+		res[top[0]] += val
+	}
+	return res
 }
 
 func printFiles(dirCount *dirCount) {
 	dirCount.mu.Lock()
 	defer dirCount.mu.Unlock()
 	fmt.Println("size len:", len(dirCount.size))
-	keys := lib.SortedKeys(dirCount.size)
+
+	sumKeys := dirCount.getTop()
+
+	var keys []string
+	var dc map[string]int64
+
+	if *summary {
+		keys = lib.SortedKeys(sumKeys)
+		dc = sumKeys
+	} else {
+		keys = lib.SortedKeys(dirCount.size)
+		dc = dirCount.size
+	}
 
 	if *topFiles > len(keys) || *topFiles == -1 {
 		fmt.Printf("Printing top available %d\n ", len(keys))
@@ -97,7 +124,7 @@ func printFiles(dirCount *dirCount) {
 	}
 
 	for _, key := range keys {
-		size := float64(dirCount.size[key])
+		size := float64(dc[key])
 		sizeGB := size / 1e9
 		sizeMB := size / 1e6
 		sizeKB := size / 1e3
