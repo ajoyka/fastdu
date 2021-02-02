@@ -14,6 +14,7 @@ import (
 	"time"
 )
 
+// dirCount is used to store byte totals for all files in specified dir
 type dirCount struct {
 	mu   sync.Mutex
 	size map[string]int64
@@ -25,8 +26,8 @@ type fileCount struct {
 	nbytes int64
 }
 
-// limit number of files that are open simultaneously to avoid
-// hitting into os limits
+// fileSizes is used for communicating file size of leaf nodes for incrementing
+// fileCount
 var fileSizes = make(chan int64)
 
 var wg sync.WaitGroup
@@ -56,7 +57,6 @@ func main() {
 	go func() {
 	loop:
 		for {
-			// fmt.Println("in loop")
 			select {
 			case size, ok := <-fileSizes:
 				if !ok {
@@ -65,7 +65,6 @@ func main() {
 				fileCount.Inc(size)
 
 			case <-tick:
-				// printFiles(dirCount)
 				files, nbytes = fileCount.Get()
 				fmt.Printf("\n%d files, %.1fGB\n", files, float64(nbytes)/1e9)
 			}
@@ -148,6 +147,20 @@ func printFiles(dirCount *dirCount) {
 
 func walkDir(dir string, dirCount *dirCount, fileSizes chan<- int64) {
 	defer wg.Done()
+
+	// handle case when fastdu is invoked including files as args like so: fastdu *
+	// check if 'dir' is a file
+
+	fInfo, err := os.Stat(dir)
+	if err != nil {
+		fmt.Print(err)
+	}
+	if !fInfo.IsDir() { // 'dir' is a file
+		dirCount.Inc(dir, fInfo.Size())
+		fileSizes <- fInfo.Size()
+		return
+	}
+
 	for _, entry := range dirents(dir) {
 		if entry.IsDir() {
 			wg.Add(1)
