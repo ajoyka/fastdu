@@ -12,12 +12,23 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/h2non/filetype"
+
+	"github.com/h2non/filetype/types"
 )
 
 // dirCount is used to store byte totals for all files in specified dir
 type dirCount struct {
 	mu   sync.Mutex
 	size map[string]int64
+	meta map[string]*Meta
+}
+
+// Meta stores metadata about the file such as os.stat info, filetype info
+type Meta struct {
+	os.FileInfo
+	types.Type
 }
 
 type fileCount struct {
@@ -26,23 +37,30 @@ type fileCount struct {
 	nbytes int64
 }
 
-// fileSizes is used for communicating file size of leaf nodes for incrementing
-// fileCount
-var fileSizes = make(chan int64)
+var (
 
-var wg sync.WaitGroup
-var topFiles = flag.Int("t", 10, "number of top files/directories to display")
-var numOpenFiles = flag.Int("c", 20, "concurrency factor")
-var summary = flag.Bool("s", false, "print summary only")
+	// fileSizes is used for communicating file size of leaf nodes for incrementing
+	// fileCount
+	fileSizes = make(chan int64)
 
-var printInterval = flag.Duration("f", 0*time.Second, "print summary at frequency specified in seconds; default disabled with value 0")
-var sema chan struct{}
+	// first 261 bytes is sufficient to identify file type
+	fileBuf = make([]byte, 261)
+
+	wg           sync.WaitGroup
+	topFiles     = flag.Int("t", 10, "number of top files/directories to display")
+	numOpenFiles = flag.Int("c", 20, "concurrency factor")
+	summary      = flag.Bool("s", false, "print summary only")
+
+	printInterval = flag.Duration("f", 0*time.Second, "print summary at frequency specified in seconds; default disabled with value 0")
+	sema          chan struct{}
+)
 
 func main() {
 	flag.Parse()
 	sema = make(chan struct{}, *numOpenFiles)
 	fmt.Println("concurrency factor", cap(sema), *numOpenFiles)
-	dirCount := &dirCount{size: make(map[string]int64)}
+	dirCount := &dirCount{size: make(map[string]int64),
+		meta: make(map[string]*Meta)}
 	fileCount := &fileCount{}
 
 	roots := flag.Args()
@@ -83,6 +101,7 @@ func main() {
 	printFiles(dirCount)
 	files, nbytes = fileCount.Get()
 	fmt.Printf("%d files, %.1fGB\n", files, float64(nbytes)/1e9)
+	printMeta(dirCount)
 
 }
 
@@ -95,6 +114,106 @@ func (d *dirCount) getTop() map[string]int64 {
 		res[top[0]] += val
 	}
 	return res
+}
+
+func walkDir(dir string, dirCount *dirCount, fileSizes chan<- int64) {
+	defer wg.Done()
+
+	// handle case when fastdu is invoked including files as args like so: fastdu *
+	// check if 'dir' is a file
+
+	fInfo, err := os.Stat(dir)
+	if err != nil {
+		fmt.Print(err)
+	} else if !fInfo.IsDir() { // 'dir' is a file
+		dirCount.Inc(dir, fInfo.Size())
+		dirCount.AddFile(dir, fInfo)
+		fileSizes <- fInfo.Size()
+		return
+	}
+
+	for _, entry := range dirents(dir) {
+		if entry.IsDir() {
+			wg.Add(1)
+			go walkDir(filepath.Join(dir, entry.Name()), dirCount, fileSizes)
+		} else {
+			dirCount.Inc(dir, entry.Size())
+			dirCount.AddFile(dir, entry)
+			fileSizes <- entry.Size()
+		}
+	}
+}
+
+func getFileType(file string) types.Type {
+	fd, _ := os.Open(file)
+	defer fd.Close()
+	fd.Read(fileBuf)
+	// b, _ := ioutil.ReadFile(file)
+	kind, _ := filetype.Match(fileBuf)
+	return kind
+}
+
+// AddFile can accept a path to dir or file as first argument
+func (d *dirCount) AddFile(file string, fInfo os.FileInfo) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !fInfo.IsDir() {
+		file = filepath.Join(file, fInfo.Name())
+	}
+	d.meta[file] = &Meta{fInfo,
+		getFileType(file)}
+}
+
+func (d *dirCount) Inc(path string, size int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.size[path] += size
+}
+
+func (f *fileCount) Inc(size int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.files++
+	f.nbytes += size
+}
+
+func (f *fileCount) Get() (int64, int64) {
+	f.mu.Lock()
+	f.mu.Unlock()
+
+	return f.files, f.nbytes
+}
+
+func dirents(dir string) []os.FileInfo {
+	sema <- struct{}{} // acquire token
+	defer func() {
+		<-sema // release token
+	}()
+
+	info, err := ioutil.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, syscall.EMFILE) {
+			fmt.Printf("\n**Error: %s\nReduce concurrency and retry\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%s, %v\n", dir, err)
+		return nil
+	}
+	return info
+}
+
+func printMeta(dirCount *dirCount) {
+	dirCount.mu.Lock()
+	defer dirCount.mu.Unlock()
+
+	for n, m := range dirCount.meta {
+		switch m.Type.MIME.Type {
+		case "image":
+			fmt.Printf("%s %+v\n", n, m.Type)
+		}
+	}
 }
 
 func printFiles(dirCount *dirCount) {
@@ -143,70 +262,4 @@ func printFiles(dirCount *dirCount) {
 		}
 		fmt.Printf("%.1f%s, %s\n", size, units, key)
 	}
-}
-
-func walkDir(dir string, dirCount *dirCount, fileSizes chan<- int64) {
-	defer wg.Done()
-
-	// handle case when fastdu is invoked including files as args like so: fastdu *
-	// check if 'dir' is a file
-
-	fInfo, err := os.Stat(dir)
-	if err != nil {
-		fmt.Print(err)
-	}
-	if !fInfo.IsDir() { // 'dir' is a file
-		dirCount.Inc(dir, fInfo.Size())
-		fileSizes <- fInfo.Size()
-		return
-	}
-
-	for _, entry := range dirents(dir) {
-		if entry.IsDir() {
-			wg.Add(1)
-			go walkDir(filepath.Join(dir, entry.Name()), dirCount, fileSizes)
-		} else {
-			dirCount.Inc(dir, entry.Size())
-			fileSizes <- entry.Size()
-		}
-	}
-}
-
-func (d *dirCount) Inc(path string, size int64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.size[path] += size
-}
-
-func (f *fileCount) Inc(size int64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.files++
-	f.nbytes += size
-}
-
-func (f *fileCount) Get() (int64, int64) {
-	f.mu.Lock()
-	f.mu.Unlock()
-
-	return f.files, f.nbytes
-}
-
-func dirents(dir string) []os.FileInfo {
-	sema <- struct{}{} // acquire token
-	defer func() {
-		<-sema // release token
-	}()
-
-	info, err := ioutil.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, syscall.EMFILE) {
-			fmt.Printf("\n**Error: %s\nReduce concurrency and retry\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("%s, %v\n", dir, err)
-		return nil
-	}
-	return info
 }
