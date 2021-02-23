@@ -22,13 +22,14 @@ import (
 type dirCount struct {
 	mu   sync.Mutex
 	size map[string]int64
-	meta map[string]*Meta
+	meta map[string]*Meta // file name (not absolute path) -> meta data map
 }
 
 // Meta stores metadata about the file such as os.stat info, filetype info
 type Meta struct {
 	os.FileInfo
 	types.Type
+	dups []string // potential list of duplicates
 }
 
 type fileCount struct {
@@ -158,11 +159,22 @@ func (d *dirCount) AddFile(file string, fInfo os.FileInfo) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if !fInfo.IsDir() {
+	if !fInfo.IsDir() { // if leaf node
 		file = filepath.Join(file, fInfo.Name())
 	}
-	d.meta[file] = &Meta{fInfo,
-		getFileType(file)}
+	base := filepath.Base(file)
+	var meta *Meta
+	var ok bool
+
+	if meta, ok = d.meta[base]; !ok {
+		meta = &Meta{fInfo,
+			getFileType(file),
+			make([]string, 0),
+		}
+		d.meta[base] = meta
+	}
+
+	meta.dups = append(meta.dups, file)
 }
 
 func (d *dirCount) Inc(path string, size int64) {
@@ -211,7 +223,7 @@ func printMeta(dirCount *dirCount) {
 	for n, m := range dirCount.meta {
 		switch m.Type.MIME.Type {
 		case "image":
-			fmt.Printf("%s %+v\n", n, m.Type)
+			fmt.Printf("%s dups: %d %+v\n", n, len(m.dups), m.Type)
 		}
 	}
 }
