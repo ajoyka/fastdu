@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fastdu/lib"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +20,8 @@ import (
 	"github.com/h2non/filetype/types"
 )
 
+const _outputFile = "file-info.json"
+
 // dirCount is used to store byte totals for all files in specified dir
 type dirCount struct {
 	mu   sync.Mutex
@@ -27,9 +31,10 @@ type dirCount struct {
 
 // Meta stores metadata about the file such as os.stat info, filetype info
 type Meta struct {
-	os.FileInfo
+	Size    int64
+	Modtime time.Time
 	types.Type
-	dups []string // potential list of duplicates
+	Dups []string // potential list of duplicates
 }
 
 type fileCount struct {
@@ -58,6 +63,8 @@ var (
 
 func main() {
 	flag.Parse()
+	createBackup(_outputFile)
+
 	sema = make(chan struct{}, *numOpenFiles)
 	fmt.Println("concurrency factor", cap(sema), *numOpenFiles)
 	dirCount := &dirCount{size: make(map[string]int64),
@@ -104,6 +111,26 @@ func main() {
 	fmt.Printf("%d files, %.1fGB\n", files, float64(nbytes)/1e9)
 	printMeta(dirCount)
 
+}
+
+// create backup file
+func createBackup(file string) {
+	if _, err := os.Stat(file); err != nil {
+		return
+	}
+
+	var r []byte
+	var err error
+
+	if r, err = ioutil.ReadFile(file); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	err = ioutil.WriteFile(file+".bak", r, 0644)
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
 // getTop returns aggregated totals for the top level
@@ -162,19 +189,30 @@ func (d *dirCount) AddFile(file string, fInfo os.FileInfo) {
 	if !fInfo.IsDir() { // if leaf node
 		file = filepath.Join(file, fInfo.Name())
 	}
+
+	fileType := getFileType(file)
+	switch fileType.MIME.Type {
+	case "image", "audio", "video":
+		// continue
+	default:
+		return
+	}
+
 	base := filepath.Base(file)
 	var meta *Meta
 	var ok bool
 
 	if meta, ok = d.meta[base]; !ok {
-		meta = &Meta{fInfo,
-			getFileType(file),
+		meta = &Meta{
+			fInfo.Size(),
+			fInfo.ModTime(),
+			fileType,
 			make([]string, 0),
 		}
 		d.meta[base] = meta
 	}
 
-	meta.dups = append(meta.dups, file)
+	meta.Dups = append(meta.Dups, file)
 }
 
 func (d *dirCount) Inc(path string, size int64) {
@@ -220,10 +258,21 @@ func printMeta(dirCount *dirCount) {
 	dirCount.mu.Lock()
 	defer dirCount.mu.Unlock()
 
+	b, err := json.MarshalIndent(dirCount.meta, "  ", "  ")
+	if err != nil {
+		fmt.Println("error:", err)
+	}
+
+	f, err := os.Create(_outputFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	f.Write(b)
+
+	fmt.Println("printing duplicate entries (if any)")
 	for n, m := range dirCount.meta {
-		switch m.Type.MIME.Type {
-		case "image":
-			fmt.Printf("%s dups: %d %+v\n", n, len(m.dups), m.Type)
+		if len(m.Dups) > 1 {
+			fmt.Printf("%s dups: %v %+v\n", n, m.Dups, m.Type)
 		}
 	}
 }
